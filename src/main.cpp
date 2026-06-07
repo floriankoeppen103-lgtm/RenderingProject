@@ -33,7 +33,7 @@ static void applyGamemodeFlags(int gm, bool& exertGravity, bool& noClip, bool& b
 
 int main(){
     bool grounded = false;
-    bool forceSort = false;
+    bool forceDistanceAssignment = false;
     bool startCounting = true;
     double time = 0.0f;
     double deltaTime    = 1.0f / (double)FPS;
@@ -67,7 +67,7 @@ int main(){
         char prebuiltPath[512];
         snprintf(prebuiltPath, sizeof(prebuiltPath), "%sworlds/prebuilt/world_data.bin", GetApplicationDirectory());
         int result = loadWorld(prebuiltPath, B, triangle, mat, (int)(sizeof(mat)/sizeof(mat[0])), blockCount);
-        if(result >= 0) { populatedTriangleCount = result; forceSort = true; }
+        if(result >= 0) { populatedTriangleCount = result; forceDistanceAssignment = true; }
     }
 
     if(getScreenDimensions) SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_WINDOW_MAXIMIZED);
@@ -83,7 +83,8 @@ int main(){
     SetTargetFPS(FPS);
     if(turnByMouse) DisableCursor();
 
-    struct vector C   = {startPos[0], startPos[1], startPos[2]};
+    double spawnPoint[3] = {startPos[0], startPos[1], startPos[2]};
+    struct vector C   = {spawnPoint[0], spawnPoint[1], spawnPoint[2]};
     struct vector Cf  = {1.0f, 0.0f, -0.5f};
     double trueWSpeedMax = forwardSpeed;
     double realFOVHeight = FOVDepth;
@@ -91,7 +92,7 @@ int main(){
     double frameTheta;
     int deathBuffer = 0;
 
-    struct block hotbar[] = {bedrock02, dirt02, grass02, oak02, leaves02, chest02};
+    struct block hotbar[] = {bedrock02, dirt02, grass02, oak02, leaves02, chest02, cobble02, dirt02};
     int hotbarSize = sizeof(hotbar) / sizeof(hotbar[0]);
     int selectedHotbarIndex = 0;
     struct block selectedMaterial = hotbar[selectedHotbarIndex];
@@ -173,7 +174,7 @@ int main(){
         int added = buildTrianglesForBlock(triangle, populatedTriangleCount, opposingBlock.x, opposingBlock.y, opposingBlock.z, placeMat, targetResolution);
         populatedTriangleCount += added;
         blockCount++;
-        forceSort = true;
+        forceDistanceAssignment = true;
     };
 
     auto handleCameraRotation = [&]() {
@@ -242,14 +243,10 @@ int main(){
             DrawText(TextFormat("Time: %.2fs", time), 20, 130, 60, WHITE);
         }
         if(deathBuffer > 0) { DrawText("YOU DIED", WindowWidth/2-200, WindowHeight/2, 100, RED); deathBuffer--; }
-        if(!startCounting) {
-            DrawText("YOU WON!", WindowWidth/2-300, WindowHeight/2-100, 100, GREEN);
-            DrawText("Press R to reset", WindowWidth/2-350, WindowHeight/2, 70, GREEN);
-        }
         if(startCounting) time += GetFrameTime();
 
         // Hotbar
-        const char* hotbarNames[] = {"bedrock", "dirt", "grass", "oak", "leaves", "chest"};
+        //const char* hotbarNames[] = {"bedrock", "dirt", "grass", "oak", "leaves", "chest", "cobblestone"};
         int hotbarX = WindowWidth/2 - (hotbarSize*70)/2;
         int hotbarY = WindowHeight - 90;
         for(int i = 0; i < hotbarSize; i++) {
@@ -265,12 +262,12 @@ int main(){
                 }
             }
             DrawRectangleLines(x, hotbarY, 60, 60, borderColor);
-            DrawText(hotbarNames[i], x+2, hotbarY+44, 11, WHITE);
+            DrawText(hotbar[i].displayName, x+2, hotbarY+44, 11, WHITE);
         }
         if(allowWorldSaveLoad)
-            DrawText("Scroll to cycle  |  F1 save  |  F2 load next", WindowWidth/2 - 195, WindowHeight - 32, 18, WHITE);
+            DrawText("Scroll to cycle  |  F1 save  |  F2 load next", WindowWidth/2 - 195, WindowHeight - 30, 18, WHITE);
         else
-            DrawText("Scroll to cycle blocks", WindowWidth/2 - 90, WindowHeight - 32, 18, WHITE);
+            DrawText("Scroll to cycle blocks", WindowWidth/2 - 90, WindowHeight - 30, 18, WHITE);
     };
 
 
@@ -408,6 +405,7 @@ int main(){
 
         if(!commandToBeExecuted.empty()) {
             int cx, cy, cz, cid, fx, fy, fz;
+            double Px, Py, Pz;
             if(sscanf(commandToBeExecuted.c_str(), "setblock %d %d %d %d", &cx, &cy, &cz, &cid) == 4) {
                 if(cx >= 0 && cx < worldWidth && cy >= 0 && cy < worldDepth && cz >= 0 && cz < worldHeight) {
                     B[cz][cy][cx] = cid;
@@ -424,7 +422,7 @@ int main(){
                     int added = buildTrianglesForBlock(triangle, populatedTriangleCount, cx, cy, cz, placeMat, targetResolution);
                     populatedTriangleCount += added;
                     blockCount++;
-                    forceSort = true;
+                    forceDistanceAssignment = true;
                 } else {
                     printf("setblock: coordinates out of bounds (%d %d %d)\n", cx, cy, cz);
                 }
@@ -465,27 +463,14 @@ int main(){
                         }
                     }
                 }
-                forceSort = true;
+                forceDistanceAssignment = true;
             }
-            else if(sscanf(commandToBeExecuted.c_str(), "setblock %d %d %d %d", &cx, &cy, &cz, &cid) == 4) {
-                if(cx >= 0 && cx < worldWidth && cy >= 0 && cy < worldDepth && cz >= 0 && cz < worldHeight) {
-                    B[cz][cy][cx] = cid;
-                    struct block placeMat = mat[0];
-                    int highestRes = 0;
-                    for(int mi = 0; mi < (int)(sizeof(mat)/sizeof(mat[0])); mi++) {
-                        if(mat[mi].ID == cid && mat[mi].PixelResolution > highestRes && mat[mi].PixelResolution <= targetResolution)
-                            highestRes = mat[mi].PixelResolution;
-                    }
-                    for(int mi = 0; mi < (int)(sizeof(mat)/sizeof(mat[0])); mi++) {
-                        if(mat[mi].ID == cid && mat[mi].PixelResolution == highestRes)
-                            placeMat = mat[mi];
-                    }
-                    int added = buildTrianglesForBlock(triangle, populatedTriangleCount, cx, cy, cz, placeMat, targetResolution);
-                    populatedTriangleCount += added;
-                    blockCount++;
-                    forceSort = true;
-                } else {
-                    printf("setblock: coordinates out of bounds (%d %d %d)\n", cx, cy, cz);
+            else if(sscanf(commandToBeExecuted.c_str(), "tp %lf %lf %lf", &Px, &Py, &Pz) == 3) {
+                if(true) {
+                    C.x = Px;
+                    C.y = Py;
+                    C.z = Pz;
+                    printf("Teleported Player to (%lf %lf %lf)\n", Px, Py, Pz);
                 }
             }
         }
@@ -504,7 +489,7 @@ int main(){
         if(Cheats && IsKeyPressed(KEY_F3)) { gamemode = (gamemode+1)%4; changeMadeToGamemode = true; }
         if(allowWorldSaveLoad && IsKeyPressed(KEY_F2)) {
             int newCount = loadNextWorldSave(B, loadedWorldName, sizeof(loadedWorldName), worldSaveCycleIndex, triangle, mat, (int)(sizeof(mat)/sizeof(mat[0])), blockCount);
-            if(newCount >= 0) { populatedTriangleCount = newCount; forceSort = true; }
+            if(newCount >= 0) { populatedTriangleCount = newCount; forceDistanceAssignment = true; }
         }
         if(blockBreakingRights && (IsKeyPressed(KEY_BACKSPACE) || IsMouseButtonPressed(MOUSE_BUTTON_LEFT)))
             handleBlockBreaking();
@@ -578,8 +563,8 @@ int main(){
 
         // Respawn / win
         if(C.z < -10.0f || IsKeyDown(KEY_R)) {
-            C = {8.0f, 8.0f, 3.5f};
-            Cf = {0.0f, 1.0f, -0.5f};
+            C = {spawnPoint[0], spawnPoint[1], spawnPoint[2]};
+            Cf = {1.0f, 0.0f, -0.5f};
             upSpeed = 0.0f; deathBuffer = 240; time = 0.0f; startCounting = true;
         }
         if(C.x>10.0f && C.x<12.0f && C.y>11.0f && C.y<13.0f && C.z>14.5f && C.z<20.0f)
@@ -596,7 +581,7 @@ int main(){
 
         // Assign distances — recalculate when moving or when a forced sort was requested.
         _bt = GetTime();
-        if(forwardSpeed != 0.0 || rightSpeed != 0.0 || upSpeed != 0.0 || forceSort) {
+        if(forwardSpeed != 0.0 || rightSpeed != 0.0 || upSpeed != 0.0 || forceDistanceAssignment) {
             for(int i = 0; i < populatedTriangleCount; i++) {
                 triangle[i].distance = length({C.x - triangle[i].Center.x, C.y - triangle[i].Center.y, C.z - triangle[i].Center.z});
             }
@@ -606,7 +591,7 @@ int main(){
         // Sort triangles farthest-first for painter's algorithm
         _bt = GetTime();
         sortTrianglesByDistance(triangle, populatedTriangleCount);
-        forceSort = false;
+        forceDistanceAssignment = false;
         timeSort = (GetTime() - _bt) * 1000.0;
 
         if(generalDebugMode && logTriangleDistances) {
@@ -630,7 +615,7 @@ int main(){
                 DrawTriangleLines({float(sv.x4),float(sv.y4)},{float(sv.x5),float(sv.y5)},{float(sv.x6),float(sv.y6)}, bcol);
                 DrawTriangleLines({float(sv.x6),float(sv.y6)},{float(sv.x5),float(sv.y5)},{float(sv.x4),float(sv.y4)}, bcol);
             };
-            drawBorderTri({0,  0,  0 }, {bW, 0,  0 }, {bW, bD, 0 });  // bottom 1
+            /*drawBorderTri({0,  0,  0 }, {bW, 0,  0 }, {bW, bD, 0 });  // bottom 1
             drawBorderTri({0,  0,  0 }, {bW, bD, 0 }, {0,  bD, 0 });  // bottom 2
             drawBorderTri({0,  0,  bH}, {bW, bD, bH}, {bW, 0,  bH});  // top 1
             drawBorderTri({0,  0,  bH}, {0,  bD, bH}, {bW, bD, bH});  // top 2
@@ -641,7 +626,22 @@ int main(){
             drawBorderTri({0,  0,  0 }, {0,  bD, 0 }, {0,  bD, bH});  // left  (x=0)  1
             drawBorderTri({0,  0,  0 }, {0,  bD, bH}, {0,  0,  bH});  // left  (x=0)  2
             drawBorderTri({bW, 0,  0 }, {bW, bD, bH}, {bW, bD, 0 });  // right (x=bW) 1
-            drawBorderTri({bW, 0,  0 }, {bW, 0,  bH}, {bW, bD, bH});  // right (x=bW) 2
+            drawBorderTri({bW, 0,  0 }, {bW, 0,  bH}, {bW, bD, bH});  // right (x=bW) 2*/
+
+            drawBorderTri({0,  0,  0 }, {bW, 0,  0 }, {bW, 0,  0 });  // bottom 1
+            drawBorderTri({0,  0,  0 }, {0 , bD, 0 }, {0 , bD, 0 });  // bottom 2
+            drawBorderTri({0,  bD, 0 }, {bW, bD, 0 }, {bW, bD, 0 });  // top 1
+            drawBorderTri({bW,  0, 0 }, {bW, bD, 0 }, {bW, bD, 0 });  // top 2
+
+            drawBorderTri({0,   0,  0 }, {0 ,  0,   bH}, {0 ,  0,   bH});  // back  (y=0)  1
+            drawBorderTri({bW,  0,  0 }, {bW,  0,   bH}, {bW,  0,   bH});  // back  (y=0)  2
+            drawBorderTri({0,  bD,  0 }, {0 ,  bD,  bH}, {0 ,  bD,  bH});  // front (y=bD) 1
+            drawBorderTri({bW, bD,  0 }, {bW,  bD,  bH}, {bW,  bD,  bH});  // front (y=bD) 2
+            
+            drawBorderTri({0,  0,  bH }, {bW, 0,  bH}, {bW, 0,  bH});  // bottom 1
+            drawBorderTri({0,  0,  bH }, {0 , bD, bH}, {0 , bD, bH});  // bottom 2
+            drawBorderTri({0,  bD, bH }, {bW, bD, bH}, {bW, bD, bH});  // top 1
+            drawBorderTri({bW,  0, bH }, {bW, bD, bH}, {bW, bD, bH});  // top 2
         }
 
         for(int i = 0; i < populatedTriangleCount; i++) {

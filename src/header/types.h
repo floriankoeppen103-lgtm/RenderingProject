@@ -34,6 +34,7 @@ struct face {
 struct block {
     int ID;
     int PixelResolution;
+    char displayName[32];
     Color topColor[4];
     Color bottomColor[4];
     Color frontColor[4];
