@@ -40,7 +40,7 @@ constexpr bool showSpeedVectors    = true;   // (o) Show forward/right/up speed
 constexpr bool showFPS             = true;   // (o) Show FPS counter
 constexpr bool showLoadedWorldName = true;   // (o) Show name of the currently loaded world
 constexpr bool showGameMode        = true;   // (o) Show current gamemode (Survival / Creative)
-constexpr bool showBenchmark       = false;   // (o) Show per-frame section timings in the overlay
+constexpr bool showBenchmark       = true;   // (o) Show per-frame section timings in the overlay
 
 // SETTINGS FOR WINDOW
 constexpr bool   getScreenDimensions = true;    // Auto-maximize window on start

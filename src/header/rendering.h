@@ -4,6 +4,7 @@
 #include "settings.h"
 #include "types.h"
 #include "vector_math.h"
+#include "thread_pool.h"
 
 static inline void timInsertionSort(struct face* arr, int left, int right) {
     for(int i = left + 1; i <= right; i++) {
@@ -31,25 +32,37 @@ static inline void timMerge(struct face* arr, int left, int mid, int right, stru
     while(i < lenLeft) arr[k++] = buf[i++];
 }
 
-inline void sortTrianglesByDistance(struct face triangle[], int populatedTriangleCount) {
+inline void sortTrianglesByDistance(struct face triangle[], int populatedTriangleCount, ThreadPool& pool) {
     int n = populatedTriangleCount;
     if(n < 2) return;
 
     static const int MIN_RUN = 32;
     static struct face* timBuf = new face[worldWidth * worldDepth * worldHeight * 12 * targetResolution * targetResolution]();
 
-    for(int i = 0; i < n; i += MIN_RUN) {
-        int end = (i + MIN_RUN - 1 < n - 1) ? i + MIN_RUN - 1 : n - 1;
-        timInsertionSort(triangle, i, end);
-    }
-
-    for(int size = MIN_RUN; size < n; size *= 2) {
-        for(int left = 0; left < n; left += 2 * size) {
-            int mid   = left + size - 1;
-            int right = (left + 2*size - 1 < n - 1) ? left + 2*size - 1 : n - 1;
-            if(mid < right)
-                timMerge(triangle, left, mid, right, timBuf);
+    // Each run is an independent, disjoint slice of the array — safe to sort in parallel.
+    int runCount = (n + MIN_RUN - 1) / MIN_RUN;
+    pool.runParallel(runCount, [&](int start, int end) {
+        for(int r = start; r < end; r++) {
+            int left = r * MIN_RUN;
+            int right = (left + MIN_RUN - 1 < n - 1) ? left + MIN_RUN - 1 : n - 1;
+            timInsertionSort(triangle, left, right);
         }
+    });
+
+    // Each merge pair at a given level touches a disjoint [left, right] slice of the
+    // array, and (by offsetting into timBuf by `left`) a disjoint scratch region too —
+    // so all pairs at a level can merge in parallel. Levels themselves stay sequential.
+    for(int size = MIN_RUN; size < n; size *= 2) {
+        int pairCount = (n + 2*size - 1) / (2*size);
+        pool.runParallel(pairCount, [&](int start, int end) {
+            for(int p = start; p < end; p++) {
+                int left  = p * 2 * size;
+                int mid   = left + size - 1;
+                int right = (left + 2*size - 1 < n - 1) ? left + 2*size - 1 : n - 1;
+                if(mid < right)
+                    timMerge(triangle, left, mid, right, timBuf + left);
+            }
+        });
     }
 }
 
@@ -119,7 +132,7 @@ inline struct sextupleVector GetSolutionVector(struct face CurrentTriangle, int 
             // 2 visible, 1 occluded → quad → 2 triangles
             struct vector Pv1, Pv2, Po;
             if     (occ1) { Po = CurrentTriangle.P1; Pv1 = CurrentTriangle.P2; Pv2 = CurrentTriangle.P3; }
-            else if(occ2) { Po = CurrentTriangle.P2; Pv1 = CurrentTriangle.P1; Pv2 = CurrentTriangle.P3; }
+            else if(occ2) { Po = CurrentTriangle.P2; Pv1 = CurrentTriangle.P3; Pv2 = CurrentTriangle.P1; }
             else          { Po = CurrentTriangle.P3; Pv1 = CurrentTriangle.P1; Pv2 = CurrentTriangle.P2; }
 
             struct vector Pc1 = clipEdge(Pv1, Po);
@@ -131,13 +144,13 @@ inline struct sextupleVector GetSolutionVector(struct face CurrentTriangle, int 
             struct vector pD = project(Pc2);
 
             return {pA.x, pA.y, pB.x, pB.y, pC.x, pC.y,
-                    pB.x, pB.y, pC.x, pC.y, pD.x, pD.y};
+                    pB.x, pB.y, pD.x, pD.y, pC.x, pC.y};
         }
 
         default: { // TWO_POINTS_OCCLUDED: 1 visible, 2 occluded → clipped triangle
             struct vector Pv, Po1, Po2;
             if     (!occ1) { Pv = CurrentTriangle.P1; Po1 = CurrentTriangle.P2; Po2 = CurrentTriangle.P3; }
-            else if(!occ2) { Pv = CurrentTriangle.P2; Po1 = CurrentTriangle.P1; Po2 = CurrentTriangle.P3; }
+            else if(!occ2) { Pv = CurrentTriangle.P2; Po1 = CurrentTriangle.P3; Po2 = CurrentTriangle.P1; }
             else           { Pv = CurrentTriangle.P3; Po1 = CurrentTriangle.P1; Po2 = CurrentTriangle.P2; }
 
             struct vector Pc1 = clipEdge(Pv, Po1);

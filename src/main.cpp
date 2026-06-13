@@ -5,11 +5,15 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <vector>
 #include <chrono>
 #include <string>
 #include <iostream>
 #include "header/settings.h"
 #include "header/types.h"
+#include "header/thread_pool.h"
 #include "header/vector_math.h"
 #include "header/ray_intersection.h"
 #include "header/rendering.h"
@@ -29,7 +33,6 @@ static void applyGamemodeFlags(int gm, bool& exertGravity, bool& noClip, bool& b
     blockPlacementRights = (gm != ADVENTURE);
     blockBreakingRights  = (gm != ADVENTURE);
 }
-
 
 int main(){
     bool grounded = false;
@@ -60,6 +63,20 @@ int main(){
 
     static struct face* triangle = new face[worldWidth*worldHeight*worldDepth*12*targetResolution*targetResolution]();
     static int B[worldHeight][worldDepth][worldWidth] = {};
+
+    // Per-triangle projection results, filled in parallel before drawing.
+    struct RenderResult {
+        struct sextupleVector sv;
+        bool visible1;
+        bool visible2;
+    };
+    static struct RenderResult* renderResults = new RenderResult[worldWidth*worldHeight*worldDepth*12*targetResolution*targetResolution]();
+
+    // Persistent worker pool for the per-frame projection/culling pass.
+    int projectionThreadCount = (int)std::thread::hardware_concurrency();
+    if(projectionThreadCount <= 0) projectionThreadCount = 1;
+    if(projectionThreadCount > 8) projectionThreadCount = 8;
+    static ThreadPool renderPool(projectionThreadCount);
 
     int blockCount = 0;
     int populatedTriangleCount = 0;
@@ -98,7 +115,7 @@ int main(){
     struct block selectedMaterial = hotbar[selectedHotbarIndex];
 
     // per-frame section timings in milliseconds — displayed when showBenchmark is true
-    double timeInput = 0.0, timePhysics = 0.0, timeDistances = 0.0, timeSort = 0.0, timeRender = 0.0, timeWait = 0.0;
+    double timeInput = 0.0, timePhysics = 0.0, timeDistances = 0.0, timeSort = 0.0, timeProjection = 0.0, timeRender = 0.0, timeWait = 0.0;
     double _bt = 0.0;
 
 
@@ -179,9 +196,10 @@ int main(){
             }
 
             for(int i = 0; i < populatedTriangleCount; i++) {
-                triangle[i].distance = length({C.x - triangle[i].Center.x, C.y - triangle[i].Center.y, C.z - triangle[i].Center.z});
+                double dx = C.x - triangle[i].Center.x, dy = C.y - triangle[i].Center.y, dz = C.z - triangle[i].Center.z;
+                triangle[i].distance = dx*dx + dy*dy + dz*dz;
             }
-            sortTrianglesByDistance(triangle, populatedTriangleCount);
+            sortTrianglesByDistance(triangle, populatedTriangleCount, renderPool);
 
             forceDistanceAssignment = true;
 
@@ -238,9 +256,10 @@ int main(){
         populatedTriangleCount += added;
         
         for(int i = 0; i < populatedTriangleCount; i++) {
-                triangle[i].distance = length({C.x - triangle[i].Center.x, C.y - triangle[i].Center.y, C.z - triangle[i].Center.z});
+                double dx = C.x - triangle[i].Center.x, dy = C.y - triangle[i].Center.y, dz = C.z - triangle[i].Center.z;
+                triangle[i].distance = dx*dx + dy*dy + dz*dz;
             }
-            sortTrianglesByDistance(triangle, populatedTriangleCount);
+            sortTrianglesByDistance(triangle, populatedTriangleCount, renderPool);
 
         blockCount++;
         forceDistanceAssignment = true;
@@ -327,8 +346,8 @@ int main(){
             if(gamemode == SPECTATOR) DrawText("Gamemode: Spectator", 10, 160, 30, BLACK);
         }
         if(showBenchmark && renderOverlay)
-            DrawText(TextFormat("Input: %.2fms   Physics: %.2fms   Dist: %.2fms   Sort: %.2fms   Render: %.2fms   Wait: %.2fms",
-                                timeInput, timePhysics, timeDistances, timeSort, timeRender, timeWait),
+            DrawText(TextFormat("Input: %.2fms   Physics: %.2fms   Dist: %.2fms   Sort: %.2fms   Proj: %.2fms   Render: %.2fms   Wait: %.2fms",
+                                timeInput, timePhysics, timeDistances, timeSort, timeProjection, timeRender, timeWait),
                      10, 192, 20, BLACK);
         if(!renderOverlay) {
             DrawText("2x2 Parkour", 30, 30, 60, WHITE);
@@ -425,6 +444,28 @@ int main(){
                 B[blockZTorso][blockYBackAfterMove ][blockXRight] || B[blockZTorso][blockYBackAfterMove ][blockXLeft] ||
                 B[blockZHead ][blockYFrontAfterMove][blockXRight] || B[blockZHead ][blockYFrontAfterMove][blockXLeft] ||
                 B[blockZHead ][blockYBackAfterMove ][blockXRight] || B[blockZHead ][blockYBackAfterMove ][blockXLeft];
+
+        // additional check diagonally :) no more bugging in da wall
+        if(!noClip && dx != 0.0 && dy != 0.0 && zHitboxInBounds && xAfterMoveInBounds && yAfterMoveInBounds) {
+            bool DiagonalBlocked =
+                B[blockZFeet ][blockYFrontAfterMove][blockXRightAfterMove] || B[blockZFeet ][blockYFrontAfterMove][blockXLeftAfterMove] ||
+                B[blockZFeet ][blockYBackAfterMove ][blockXRightAfterMove] || B[blockZFeet ][blockYBackAfterMove ][blockXLeftAfterMove] ||
+                B[blockZTorso][blockYFrontAfterMove][blockXRightAfterMove] || B[blockZTorso][blockYFrontAfterMove][blockXLeftAfterMove] ||
+                B[blockZTorso][blockYBackAfterMove ][blockXRightAfterMove] || B[blockZTorso][blockYBackAfterMove ][blockXLeftAfterMove] ||
+                B[blockZHead ][blockYFrontAfterMove][blockXRightAfterMove] || B[blockZHead ][blockYFrontAfterMove][blockXLeftAfterMove] ||
+                B[blockZHead ][blockYBackAfterMove ][blockXRightAfterMove] || B[blockZHead ][blockYBackAfterMove ][blockXLeftAfterMove];
+            if(DiagonalBlocked) {
+                // Can't go diagonally — let the player slide along whichever single
+                // axis is actually open, and block the other one outright (even if
+                // it would also be individually fine on its own).
+                if(!XDirectionBlocked) {
+                    YDirectionBlocked = true;
+                } else if(!YDirectionBlocked) {
+                    XDirectionBlocked = true;
+                }
+            }
+        }
+
 
         if(!noClip && xCurrentInBounds && yCurrentInBounds) {
             if(blockZFeetAfterMove >= 0 && blockZFeetAfterMove < worldHeight)
@@ -634,8 +675,9 @@ int main(){
         _bt = GetTime();
 
         // Sprinting — FOV multiplier
+        bool unlimitedSpeedMode = (gamemode == CREATIVE || gamemode == SPECTATOR);
         if(IsKeyDown(KEY_LEFT_CONTROL) && (!blockAllMovementInputs) && IsKeyDown(KEY_W)) {
-            trueWSpeedMax = initWSpeedMax + SprintBoost;
+            trueWSpeedMax = unlimitedSpeedMode ? 100.0 : (initWSpeedMax + SprintBoost);
             realFOVHeight *= 1.05f; realFOVWidth *= 1.05f;
             if(realFOVHeight > FOVHeight*sprintFOVMultiplier) realFOVHeight = FOVHeight*sprintFOVMultiplier;
             if(realFOVWidth  > FOVWidth *sprintFOVMultiplier) realFOVWidth  = FOVWidth *sprintFOVMultiplier;
@@ -646,49 +688,55 @@ int main(){
             if(realFOVWidth  < FOVWidth ) realFOVWidth  = FOVWidth;
         }
 
+        double scaledSlowdownFactor = slowdownFactor * deltaTime * 60.0;
+        double scaledSpeedupFactor  = speedupFactor  * deltaTime * 60.0;
+
         // Forwards & Backwards
         if((IsKeyDown(KEY_W) && IsKeyDown(KEY_S)) || (!IsKeyDown(KEY_W) && !IsKeyDown(KEY_S))) {
-            if(forwardSpeed > 0) forwardSpeed -= slowdownFactor;
-            else if(forwardSpeed < 0) forwardSpeed += slowdownFactor;
-            if(fabs(forwardSpeed) <= slowdownFactor) forwardSpeed = 0.0f;
+            double fwdSlowdown = (fabs(forwardSpeed) > 30.0) ? scaledSlowdownFactor * 2.0 : scaledSlowdownFactor;
+            if(forwardSpeed > 0) forwardSpeed -= fwdSlowdown;
+            else if(forwardSpeed < 0) forwardSpeed += fwdSlowdown;
+            if(fabs(forwardSpeed) <= fwdSlowdown) forwardSpeed = 0.0f;
         } else if(IsKeyDown(KEY_W) && !blockAllMovementInputs) {
-            forwardSpeed += speedupFactor;
+            forwardSpeed += scaledSpeedupFactor;
             if(forwardSpeed > trueWSpeedMax) forwardSpeed = trueWSpeedMax;
         } else if(IsKeyDown(KEY_S) && !blockAllMovementInputs) {
-            forwardSpeed -= speedupFactor;
+            forwardSpeed -= scaledSpeedupFactor;
             if(forwardSpeed < SSpeedMax) forwardSpeed = SSpeedMax;
         }
 
         // Right & Left
         if((IsKeyDown(KEY_A) && IsKeyDown(KEY_D)) || (!IsKeyDown(KEY_A) && !IsKeyDown(KEY_D))) {
-            if(rightSpeed > 0) rightSpeed -= slowdownFactor;
-            else if(rightSpeed < 0) rightSpeed += slowdownFactor;
-            if(fabs(rightSpeed) <= slowdownFactor) rightSpeed = 0.0f;
+            double rightSlowdown = (fabs(rightSpeed) > 30.0) ? scaledSlowdownFactor * 2.0 : scaledSlowdownFactor;
+            if(rightSpeed > 0) rightSpeed -= rightSlowdown;
+            else if(rightSpeed < 0) rightSpeed += rightSlowdown;
+            if(fabs(rightSpeed) <= rightSlowdown) rightSpeed = 0.0f;
         } else if(IsKeyDown(KEY_D) && !blockAllMovementInputs) {
-            rightSpeed += speedupFactor;
+            rightSpeed += scaledSpeedupFactor;
             if(rightSpeed > DSpeedMax) rightSpeed = DSpeedMax;
         } else if(IsKeyDown(KEY_A) && !blockAllMovementInputs) {
-            rightSpeed -= speedupFactor;
+            rightSpeed -= scaledSpeedupFactor;
             if(rightSpeed < ASpeedMax) rightSpeed = ASpeedMax;
         }
 
         // Up / Down  (flight or gravity + jump)
         if(!exertGravity) {
             if((IsKeyDown(KEY_SPACE) && IsKeyDown(KEY_LEFT_SHIFT)) || (!IsKeyDown(KEY_SPACE) && !IsKeyDown(KEY_LEFT_SHIFT))) {
-                if(upSpeed > 0.0f) upSpeed -= slowdownFactor;
-                else if(upSpeed < 0.0f) upSpeed += slowdownFactor;
-                if(fabs(upSpeed) <= slowdownFactor) upSpeed = 0.0f;
+                double upSlowdown = (fabs(upSpeed) > 30.0) ? scaledSlowdownFactor * 2.0 : scaledSlowdownFactor;
+                if(upSpeed > 0.0f) upSpeed -= upSlowdown;
+                else if(upSpeed < 0.0f) upSpeed += upSlowdown;
+                if(fabs(upSpeed) <= upSlowdown) upSpeed = 0.0f;
             } else if(IsKeyDown(KEY_SPACE) && !blockAllMovementInputs) {
-                upSpeed += speedupFactor;
+                upSpeed += scaledSpeedupFactor;
                 if(upSpeed > SpaceSpeedMax) upSpeed = SpaceSpeedMax;
             } else if(IsKeyDown(KEY_LEFT_SHIFT) && !blockAllMovementInputs) {
-                upSpeed -= speedupFactor;
+                upSpeed -= scaledSpeedupFactor;
                 if(upSpeed < ShiftSpeedMax) upSpeed = ShiftSpeedMax;
             }
         } else {
             if(IsKeyDown(KEY_SPACE) && !blockAllMovementInputs && upSpeed == 0.0f && grounded)
                 upSpeed = SpaceSpeedMax;
-            upSpeed -= slowdownFactor;
+            upSpeed -= scaledSlowdownFactor;
         }
 
         applyCollisionAndMove();
@@ -708,14 +756,15 @@ int main(){
         _bt = GetTime();
         if(forwardSpeed != 0.0 || rightSpeed != 0.0 || upSpeed != 0.0 || forceDistanceAssignment) {
             for(int i = 0; i < populatedTriangleCount; i++) {
-                triangle[i].distance = length({C.x - triangle[i].Center.x, C.y - triangle[i].Center.y, C.z - triangle[i].Center.z});
+                double dx = C.x - triangle[i].Center.x, dy = C.y - triangle[i].Center.y, dz = C.z - triangle[i].Center.z;
+                triangle[i].distance = dx*dx + dy*dy + dz*dz;
             }
         }
         timeDistances = (GetTime() - _bt) * 1000.0;
 
         // Sort triangles farthest-first for painter's algorithm
         _bt = GetTime();
-        sortTrianglesByDistance(triangle, populatedTriangleCount);
+        sortTrianglesByDistance(triangle, populatedTriangleCount, renderPool);
         forceDistanceAssignment = false;
         timeSort = (GetTime() - _bt) * 1000.0;
 
@@ -723,6 +772,30 @@ int main(){
             printf("\n\n\n\n");
             for(int i = 0; i < populatedTriangleCount; i++) printf("Distance: %.2f\n", triangle[i].distance);
         }
+
+        // Project & backface-cull all triangles in parallel, before any GL calls.
+        _bt = GetTime();
+        renderPool.runParallel(populatedTriangleCount, [&](int start, int end) {
+            for(int i = start; i < end; i++) {
+                struct sextupleVector sv = GetSolutionVector(triangle[i], WindowWidth, WindowHeight, C, Cf, FOVDepth, realFOVWidth, realFOVHeight);
+
+                struct vector a1 = {sv.x1, sv.y1, 0}, a2 = {sv.x2, sv.y2, 0}, a3 = {sv.x3, sv.y3, 0};
+                struct vector edge1a = {a2.x-a1.x, a2.y-a1.y, a2.z-a1.z};
+                struct vector edge2a = {a3.x-a1.x, a3.y-a1.y, a3.z-a1.z};
+                bool visible1 = crossProduct(edge1a, edge2a).z < 0;
+
+                bool visible2 = false;
+                if(sv.x4 != 0.0) {
+                    struct vector b1 = {sv.x4, sv.y4, 0}, b2 = {sv.x5, sv.y5, 0}, b3 = {sv.x6, sv.y6, 0};
+                    struct vector edge1b = {b2.x-b1.x, b2.y-b1.y, b2.z-b1.z};
+                    struct vector edge2b = {b3.x-b1.x, b3.y-b1.y, b3.z-b1.z};
+                    visible2 = crossProduct(edge1b, edge2b).z < 0;
+                }
+
+                renderResults[i] = {sv, visible1, visible2};
+            }
+        });
+        timeProjection = (GetTime() - _bt) * 1000.0;
 
         // DRAW
         _bt = GetTime();
@@ -758,16 +831,17 @@ int main(){
         }
 
         for(int i = 0; i < populatedTriangleCount; i++) {
-            struct sextupleVector sv = GetSolutionVector(triangle[i], WindowWidth, WindowHeight, C, Cf, FOVDepth, realFOVWidth, realFOVHeight);
-            struct Vector2 v1={float(sv.x1),float(sv.y1)}, v2={float(sv.x2),float(sv.y2)}, v3={float(sv.x3),float(sv.y3)};
-            struct Vector2 v4={float(sv.x4),float(sv.y4)}, v5={float(sv.x5),float(sv.y5)}, v6={float(sv.x6),float(sv.y6)};
+            struct RenderResult& rr = renderResults[i];
+            struct Vector2 v1={float(rr.sv.x1),float(rr.sv.y1)}, v2={float(rr.sv.x2),float(rr.sv.y2)}, v3={float(rr.sv.x3),float(rr.sv.y3)};
+            struct Vector2 v4={float(rr.sv.x4),float(rr.sv.y4)}, v5={float(rr.sv.x5),float(rr.sv.y5)}, v6={float(rr.sv.x6),float(rr.sv.y6)};
+
             if(drawSurfaces) {
-                DrawTriangle(v1,v2,v3,triangle[i].Colour); DrawTriangle(v3,v2,v1,triangle[i].Colour);
-                DrawTriangle(v4,v5,v6,triangle[i].Colour); DrawTriangle(v6,v5,v4,triangle[i].Colour);
+                if(rr.visible1) DrawTriangle(v1,v2,v3,triangle[i].Colour);
+                if(rr.visible2) DrawTriangle(v4,v5,v6,triangle[i].Colour);
             }
             if(drawWireframe) {
-                DrawTriangleLines(v1,v2,v3,BLACK); DrawTriangleLines(v3,v2,v1,BLACK);
-                DrawTriangleLines(v4,v5,v6,BLACK); DrawTriangleLines(v6,v5,v4,BLACK);
+                if(rr.visible1) { DrawTriangleLines(v1,v2,v3,BLACK); DrawTriangleLines(v3,v2,v1,BLACK); }
+                if(rr.visible2) { DrawTriangleLines(v4,v5,v6,BLACK); DrawTriangleLines(v6,v5,v4,BLACK); }
             }
         }
 
